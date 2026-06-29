@@ -60,8 +60,10 @@ impl PatchSignals {
             ));
         }
 
-        for line in self.signals.split('\n') {
-            data.push(format!("{SIGNALS_DATALINE_LITERAL} {line}"));
+        if !self.signals.is_empty() {
+            for line in self.signals.split('\n') {
+                data.push(format!("{SIGNALS_DATALINE_LITERAL} {line}"));
+            }
         }
 
         DatastarEvent {

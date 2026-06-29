@@ -31,6 +31,8 @@ pub enum SseError {
     Signals(#[from] SignalError),
     #[error("failed to compress event: {0}")]
     Compression(#[from] std::io::Error),
+    #[error("SSE source stream failed: {0}")]
+    Source(std::io::Error),
     #[error("SSE stream is closed")]
     Closed,
 }
@@ -111,7 +113,10 @@ impl DatastarSseBuilder {
         tokio::spawn(
             async move {
                 if let Err(err) = f(sender).await {
-                    error!(%err, "Datastar SSE task failed");
+                    match err {
+                        SseError::Closed => debug!("Datastar SSE client disconnected"),
+                        err => error!(%err, "Datastar SSE task failed"),
+                    }
                 }
             }
             .instrument(tracing::info_span!("datastar_sse_task")),
@@ -175,7 +180,7 @@ impl DatastarSse {
             .map(move |event| -> Result<Bytes, SseError> {
                 let event = event.map_err(|err| {
                     error!(%err, "Datastar SSE source stream failed");
-                    SseError::Compression(std::io::Error::other(err))
+                    SseError::Source(std::io::Error::other(err))
                 })?;
                 let event_type = event.event.as_str();
                 let bytes = Bytes::from(event.to_sse_string());
@@ -231,26 +236,32 @@ where
 {
     let (writer, reader) = tokio::io::duplex(64 * 1024);
 
-    tokio::spawn(async move {
-        let result = match algorithm {
-            crate::CompressionAlgorithm::Brotli => {
-                write_compressed_stream(BrotliEncoder::new(writer), stream, algorithm).await
-            }
-            crate::CompressionAlgorithm::Zstd => {
-                write_compressed_stream(ZstdEncoder::new(writer), stream, algorithm).await
-            }
-            crate::CompressionAlgorithm::Gzip => {
-                write_compressed_stream(GzipEncoder::new(writer), stream, algorithm).await
-            }
-            crate::CompressionAlgorithm::Deflate => {
-                write_compressed_stream(ZlibEncoder::new(writer), stream, algorithm).await
-            }
-        };
+    tokio::spawn(
+        async move {
+            let result = match algorithm {
+                crate::CompressionAlgorithm::Brotli => {
+                    write_compressed_stream(BrotliEncoder::new(writer), stream, algorithm).await
+                }
+                crate::CompressionAlgorithm::Zstd => {
+                    write_compressed_stream(ZstdEncoder::new(writer), stream, algorithm).await
+                }
+                crate::CompressionAlgorithm::Gzip => {
+                    write_compressed_stream(GzipEncoder::new(writer), stream, algorithm).await
+                }
+                crate::CompressionAlgorithm::Deflate => {
+                    write_compressed_stream(ZlibEncoder::new(writer), stream, algorithm).await
+                }
+            };
 
-        if let Err(err) = result {
-            error!(%err, "Datastar SSE compression stream failed");
+            if let Err(err) = result {
+                match err {
+                    SseError::Source(err) => error!(%err, "Datastar SSE source stream failed"),
+                    err => error!(%err, "Datastar SSE compression stream failed"),
+                }
+            }
         }
-    });
+        .instrument(tracing::debug_span!("datastar_sse_compression")),
+    );
 
     ReaderStream::new(reader)
 }
@@ -260,7 +271,7 @@ async fn write_compressed_stream<W, S, E>(
     mut writer: W,
     stream: S,
     algorithm: crate::CompressionAlgorithm,
-) -> Result<(), std::io::Error>
+) -> Result<(), SseError>
 where
     W: AsyncWrite + Unpin,
     S: Stream<Item = Result<DatastarEvent, E>>,
@@ -270,7 +281,7 @@ where
     while let Some(event) = stream.next().await {
         let event = event.map_err(|err| {
             error!(%err, "Datastar SSE source stream failed");
-            std::io::Error::other(err)
+            SseError::Source(std::io::Error::other(err))
         })?;
         let event_type = event.event.as_str();
         let bytes = event.to_sse_string();
@@ -284,7 +295,8 @@ where
         );
     }
 
-    writer.shutdown().await
+    writer.shutdown().await?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

@@ -1,17 +1,22 @@
 use {
     datastar_axum::{
         DatastarEvent, DispatchCustomEventOptions, ElementPatchMode, ExecuteScript, Namespace,
-        PatchElements, PatchSignals, console_log, dispatch_custom_event_with_options, redirect,
-        remove_element_by_id,
+        PatchElements, PatchSignals, SseError, console_log, dispatch_custom_event_with_options,
+        redirect, remove_element_by_id,
     },
+    proptest::prelude::*,
     serde::Serialize,
-    std::time::Duration,
+    std::{error::Error, fmt, time::Duration},
 };
 
 #[cfg(feature = "compression")]
 use {
+    axum::http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_TYPE},
     datastar_axum::{Compression, CompressionAlgorithm, CompressionStrategy},
-    http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_TYPE},
+    std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    },
     tokio::io::AsyncReadExt,
 };
 
@@ -64,6 +69,16 @@ fn empty_patch_elements_omits_elements_dataline() {
     assert_eq!(
         event.to_sse_string(),
         concat!("event: datastar-patch-elements\n", "\n",)
+    );
+}
+
+#[test]
+fn empty_patch_signals_omits_signals_dataline() {
+    let event: DatastarEvent = PatchSignals::new("").into();
+
+    assert_eq!(
+        event.to_sse_string(),
+        concat!("event: datastar-patch-signals\n", "\n",)
     );
 }
 
@@ -256,6 +271,37 @@ async fn compression_stream_contains_multiple_events() {
     }
 }
 
+#[tokio::test]
+#[cfg(feature = "compression")]
+async fn compressed_source_stream_errors_are_logged_as_source_errors() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let stream = futures_util::stream::iter([Err::<DatastarEvent, _>(TestSourceError)]);
+    let sse = datastar_axum::DatastarSse::builder()
+        .compression(
+            Compression::default()
+                .strategy(CompressionStrategy::Forced)
+                .algorithms([CompressionAlgorithm::Gzip]),
+        )
+        .stream(stream);
+    let response = axum::response::IntoResponse::into_response(sse);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty());
+
+    let logs = logs.as_string();
+    assert!(logs.contains("Datastar SSE source stream failed"));
+    assert!(!logs.contains("Datastar SSE compression stream failed"));
+}
+
 #[cfg(feature = "compression")]
 async fn decode_body(algorithm: CompressionAlgorithm, body: &[u8]) -> String {
     let mut decompressed = String::new();
@@ -296,4 +342,214 @@ async fn channel_sender_streams_events() {
     let body = String::from_utf8(body.to_vec()).unwrap();
 
     assert!(body.contains("data: elements <div id=\"x\">x</div>"));
+}
+
+#[tokio::test]
+async fn source_stream_errors_are_reported_as_source_errors() {
+    let stream = futures_util::stream::iter([Err::<DatastarEvent, _>(TestSourceError)]);
+    let response =
+        axum::response::IntoResponse::into_response(datastar_axum::DatastarSse::new(stream));
+
+    let err = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("SSE source stream failed"));
+}
+
+#[test]
+fn source_error_display_is_distinct_from_compression_error() {
+    let err = SseError::Source(std::io::Error::other("database failed"));
+
+    assert_eq!(err.to_string(), "SSE source stream failed: database failed");
+}
+
+proptest! {
+    #[test]
+    fn patch_signals_serializes_go_sdk_dataline_shape(
+        lines in payload_lines(),
+        only_if_missing in any::<bool>(),
+    ) {
+        let signals = lines.join("\n");
+        let event = PatchSignals::new(signals.as_str()).only_if_missing(only_if_missing);
+        let body = DatastarEvent::from(event).to_sse_string();
+        let data = data_lines(&body);
+
+        let mut expected = Vec::new();
+        if only_if_missing {
+            expected.push("onlyIfMissing true".to_owned());
+        }
+        expected.extend(payload_datalines("signals", &signals));
+
+        prop_assert_eq!(data, expected);
+        prop_assert!(body.starts_with("event: datastar-patch-signals\n"));
+        prop_assert!(body.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn patch_elements_serializes_go_sdk_dataline_shape(
+        lines in payload_lines(),
+        selector in prop::option::of(non_empty_payload_line()),
+        mode in element_patch_mode(),
+        namespace in namespace(),
+        use_view_transition in any::<bool>(),
+        view_transition_selector in prop::option::of(non_empty_payload_line()),
+    ) {
+        let elements = lines.join("\n");
+        let mut event = PatchElements::new(elements.as_str())
+            .mode(mode)
+            .namespace(namespace)
+            .use_view_transition(use_view_transition);
+
+        if let Some(selector) = &selector {
+            event = event.selector(selector);
+        }
+        if let Some(view_transition_selector) = &view_transition_selector {
+            event = event.view_transition_selector(view_transition_selector);
+        }
+
+        let body = DatastarEvent::from(event).to_sse_string();
+        let data = data_lines(&body);
+
+        let mut expected = Vec::new();
+        if let Some(selector) = selector {
+            expected.push(format!("selector {selector}"));
+        }
+        if mode != ElementPatchMode::Outer {
+            expected.push(format!("mode {}", mode.as_str()));
+        }
+        if namespace != Namespace::Html {
+            expected.push(format!("namespace {}", namespace.as_str()));
+        }
+        if use_view_transition {
+            expected.push("useViewTransition true".to_owned());
+            if let Some(view_transition_selector) = view_transition_selector {
+                expected.push(format!("viewTransitionSelector {view_transition_selector}"));
+            }
+        }
+        expected.extend(payload_datalines("elements", &elements));
+
+        prop_assert_eq!(data, expected);
+        prop_assert!(body.starts_with("event: datastar-patch-elements\n"));
+        prop_assert!(body.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn datastar_event_retry_matches_sse_and_go_sdk_defaults(
+        retry_ms in 0_u64..5_000,
+    ) {
+        let event = DatastarEvent::new(
+            datastar_axum::EventType::PatchElements,
+            vec!["elements <div></div>".to_owned()],
+        )
+        .retry(Duration::from_millis(retry_ms));
+        let body = event.to_sse_string();
+
+        if retry_ms == 0 || retry_ms == 1_000 {
+            prop_assert!(!body.contains("\nretry: "));
+        } else {
+            let expected = format!("\nretry: {retry_ms}\n");
+            prop_assert!(body.contains(&expected));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TestSourceError;
+
+impl fmt::Display for TestSourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("source failed")
+    }
+}
+
+impl Error for TestSourceError {}
+
+#[derive(Clone, Default)]
+#[cfg(feature = "compression")]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(feature = "compression")]
+impl CapturedLogs {
+    fn as_string(&self) -> String {
+        let bytes = self.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+}
+
+#[cfg(feature = "compression")]
+struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(feature = "compression")]
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+    type Writer = CapturedLogWriter;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        CapturedLogWriter(Arc::clone(&self.0))
+    }
+}
+
+#[cfg(feature = "compression")]
+impl Write for CapturedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn payload_lines() -> impl Strategy<Value = Vec<String>> {
+    prop_oneof![
+        Just(Vec::new()),
+        prop::collection::vec(payload_line(), 1..8),
+    ]
+}
+
+fn payload_line() -> impl Strategy<Value = String> {
+    "[ -~]{0,32}"
+}
+
+fn non_empty_payload_line() -> impl Strategy<Value = String> {
+    "[ -~]{1,32}"
+}
+
+fn element_patch_mode() -> impl Strategy<Value = ElementPatchMode> {
+    prop_oneof![
+        Just(ElementPatchMode::Outer),
+        Just(ElementPatchMode::Inner),
+        Just(ElementPatchMode::Remove),
+        Just(ElementPatchMode::Replace),
+        Just(ElementPatchMode::Prepend),
+        Just(ElementPatchMode::Append),
+        Just(ElementPatchMode::Before),
+        Just(ElementPatchMode::After),
+    ]
+}
+
+fn namespace() -> impl Strategy<Value = Namespace> {
+    prop_oneof![
+        Just(Namespace::Html),
+        Just(Namespace::Svg),
+        Just(Namespace::Mathml),
+    ]
+}
+
+fn data_lines(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: ").map(ToOwned::to_owned))
+        .collect()
+}
+
+fn payload_datalines(prefix: &str, payload: &str) -> Vec<String> {
+    if payload.is_empty() {
+        return Vec::new();
+    }
+
+    payload
+        .split('\n')
+        .map(|line| format!("{prefix} {line}"))
+        .collect()
 }
