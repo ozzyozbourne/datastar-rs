@@ -35,7 +35,7 @@ impl DatastarEvent {
             writeln!(out, "id: {id}")?;
         }
 
-        if self.retry != consts::DEFAULT_SSE_RETRY_DURATION {
+        if self.retry > Duration::ZERO && self.retry != consts::DEFAULT_SSE_RETRY_DURATION {
             writeln!(out, "retry: {}", self.retry.as_millis())?;
         }
 

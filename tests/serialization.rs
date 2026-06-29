@@ -1,7 +1,8 @@
 use {
     datastar_axum::{
-        DatastarEvent, ElementPatchMode, ExecuteScript, Namespace, PatchElements, PatchSignals,
-        console_log, redirect, remove_element_by_id,
+        DatastarEvent, DispatchCustomEventOptions, ElementPatchMode, ExecuteScript, Namespace,
+        PatchElements, PatchSignals, console_log, dispatch_custom_event_with_options, redirect,
+        remove_element_by_id,
     },
     serde::Serialize,
     std::time::Duration,
@@ -10,9 +11,8 @@ use {
 #[cfg(feature = "compression")]
 use {
     datastar_axum::{Compression, CompressionAlgorithm, CompressionStrategy},
-    flate2::read::GzDecoder,
-    http::header::{CONTENT_ENCODING, CONTENT_TYPE},
-    std::io::Read,
+    http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_TYPE},
+    tokio::io::AsyncReadExt,
 };
 
 #[test]
@@ -58,6 +58,45 @@ fn remove_element_uses_remove_mode_without_elements() {
 }
 
 #[test]
+fn empty_patch_elements_omits_elements_dataline() {
+    let event: DatastarEvent = PatchElements::new("").into();
+
+    assert_eq!(
+        event.to_sse_string(),
+        concat!("event: datastar-patch-elements\n", "\n",)
+    );
+}
+
+#[test]
+fn zero_retry_is_suppressed() {
+    let event = DatastarEvent::new(
+        datastar_axum::EventType::PatchElements,
+        vec!["elements <div></div>".to_owned()],
+    )
+    .retry(Duration::ZERO);
+
+    assert_eq!(
+        event.to_sse_string(),
+        concat!(
+            "event: datastar-patch-elements\n",
+            "data: elements <div></div>\n",
+            "\n",
+        )
+    );
+}
+
+#[test]
+fn positive_non_default_retry_is_emitted() {
+    let event = DatastarEvent::new(
+        datastar_axum::EventType::PatchElements,
+        vec!["elements <div></div>".to_owned()],
+    )
+    .retry(Duration::from_millis(2500));
+
+    assert!(event.to_sse_string().contains("retry: 2500\n"));
+}
+
+#[test]
 fn patch_signals_can_serialize_json() {
     #[derive(Serialize)]
     struct Store {
@@ -82,6 +121,32 @@ fn patch_signals_can_serialize_json() {
             "\n",
         )
     );
+}
+
+#[test]
+fn dispatch_custom_event_options_are_configurable() {
+    #[derive(Serialize)]
+    struct Detail {
+        saved: bool,
+    }
+
+    let event: DatastarEvent = dispatch_custom_event_with_options(
+        "saved",
+        &Detail { saved: true },
+        DispatchCustomEventOptions::default()
+            .selector("#target")
+            .bubbles(false)
+            .cancelable(false)
+            .composed(false),
+    )
+    .unwrap()
+    .into();
+    let body = event.to_sse_string();
+
+    assert!(body.contains(r##"document.querySelectorAll("#target")"##));
+    assert!(body.contains("bubbles: false"));
+    assert!(body.contains("cancelable: false"));
+    assert!(body.contains("composed: false"));
 }
 
 #[test]
@@ -146,15 +211,73 @@ async fn axum_response_sets_sse_and_compression_headers() {
         response.headers().get(CONTENT_TYPE).unwrap(),
         "text/event-stream"
     );
+    assert_eq!(response.headers().get(CONNECTION).unwrap(), "keep-alive");
     assert_eq!(response.headers().get(CONTENT_ENCODING).unwrap(), "gzip");
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let mut decoder = GzDecoder::new(body.as_ref());
-    let mut decompressed = String::new();
-    decoder.read_to_string(&mut decompressed).unwrap();
+    let decompressed = decode_body(CompressionAlgorithm::Gzip, body.as_ref()).await;
     assert!(decompressed.contains("event: datastar-patch-elements"));
+}
+
+#[tokio::test]
+#[cfg(feature = "compression")]
+async fn compression_stream_contains_multiple_events() {
+    for algorithm in [
+        CompressionAlgorithm::Brotli,
+        CompressionAlgorithm::Zstd,
+        CompressionAlgorithm::Gzip,
+        CompressionAlgorithm::Deflate,
+    ] {
+        let sse = datastar_axum::DatastarSse::builder()
+            .compression(
+                Compression::default()
+                    .strategy(CompressionStrategy::Forced)
+                    .algorithms([algorithm]),
+            )
+            .events([
+                PatchElements::new("<div id=\"one\"></div>").into(),
+                PatchElements::new("<div id=\"two\"></div>").into(),
+            ]);
+
+        let response = axum::response::IntoResponse::into_response(sse);
+        assert_eq!(
+            response.headers().get(CONTENT_ENCODING).unwrap(),
+            algorithm.encoding()
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decompressed = decode_body(algorithm, body.as_ref()).await;
+        assert!(decompressed.contains("data: elements <div id=\"one\"></div>"));
+        assert!(decompressed.contains("data: elements <div id=\"two\"></div>"));
+    }
+}
+
+#[cfg(feature = "compression")]
+async fn decode_body(algorithm: CompressionAlgorithm, body: &[u8]) -> String {
+    let mut decompressed = String::new();
+    match algorithm {
+        CompressionAlgorithm::Brotli => {
+            let mut decoder = async_compression::tokio::bufread::BrotliDecoder::new(body);
+            decoder.read_to_string(&mut decompressed).await.unwrap();
+        }
+        CompressionAlgorithm::Zstd => {
+            let mut decoder = async_compression::tokio::bufread::ZstdDecoder::new(body);
+            decoder.read_to_string(&mut decompressed).await.unwrap();
+        }
+        CompressionAlgorithm::Gzip => {
+            let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(body);
+            decoder.read_to_string(&mut decompressed).await.unwrap();
+        }
+        CompressionAlgorithm::Deflate => {
+            let mut decoder = async_compression::tokio::bufread::ZlibDecoder::new(body);
+            decoder.read_to_string(&mut decompressed).await.unwrap();
+        }
+    }
+    decompressed
 }
 
 #[tokio::test]

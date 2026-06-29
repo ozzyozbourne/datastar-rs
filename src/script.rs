@@ -141,7 +141,7 @@ pub fn dispatch_custom_event<T: Serialize>(
     event_name: impl AsRef<str>,
     detail: &T,
 ) -> Result<ExecuteScript, ScriptError> {
-    dispatch_custom_event_to(event_name, detail, None)
+    dispatch_custom_event_with_options(event_name, detail, DispatchCustomEventOptions::default())
 }
 
 pub fn dispatch_custom_event_to<T: Serialize>(
@@ -149,13 +149,77 @@ pub fn dispatch_custom_event_to<T: Serialize>(
     detail: &T,
     selector: Option<&str>,
 ) -> Result<ExecuteScript, ScriptError> {
+    dispatch_custom_event_with_options(
+        event_name,
+        detail,
+        DispatchCustomEventOptions::default().selector_opt(selector),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchCustomEventOptions {
+    pub selector: Option<String>,
+    pub bubbles: bool,
+    pub cancelable: bool,
+    pub composed: bool,
+}
+
+impl Default for DispatchCustomEventOptions {
+    fn default() -> Self {
+        Self {
+            selector: None,
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+        }
+    }
+}
+
+impl DispatchCustomEventOptions {
+    pub fn selector(mut self, selector: impl Into<String>) -> Self {
+        self.selector = Some(selector.into());
+        self
+    }
+
+    pub fn selector_opt(mut self, selector: Option<&str>) -> Self {
+        self.selector = selector.map(ToOwned::to_owned);
+        self
+    }
+
+    pub fn bubbles(mut self, bubbles: bool) -> Self {
+        self.bubbles = bubbles;
+        self
+    }
+
+    pub fn cancelable(mut self, cancelable: bool) -> Self {
+        self.cancelable = cancelable;
+        self
+    }
+
+    pub fn composed(mut self, composed: bool) -> Self {
+        self.composed = composed;
+        self
+    }
+}
+
+pub fn dispatch_custom_event_with_options<T: Serialize>(
+    event_name: impl AsRef<str>,
+    detail: &T,
+    options: DispatchCustomEventOptions,
+) -> Result<ExecuteScript, ScriptError> {
     let event_name = event_name.as_ref();
     if event_name.is_empty() {
         return Err(ScriptError::EmptyEventName);
     }
 
     let detail = serde_json::to_string(detail)?;
-    let elements = selector.map_or_else(
+    let DispatchCustomEventOptions {
+        selector,
+        bubbles,
+        cancelable,
+        composed,
+    } = options;
+    let elements = selector.as_deref().map_or_else(
         || "[document]".to_owned(),
         |selector| format!("document.querySelectorAll({selector:?})"),
     );
@@ -164,9 +228,9 @@ pub fn dispatch_custom_event_to<T: Serialize>(
         r"{{
   const elements = {elements};
   const event = new CustomEvent({event_name:?}, {{
-    bubbles: true,
-    cancelable: true,
-    composed: true,
+    bubbles: {bubbles},
+    cancelable: {cancelable},
+    composed: {composed},
     detail: {detail},
   }});
   elements.forEach((element) => {{

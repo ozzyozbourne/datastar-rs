@@ -120,7 +120,9 @@ impl PatchElements {
             }
         }
 
-        if let Some(elements) = &self.elements {
+        if let Some(elements) = &self.elements
+            && !elements.is_empty()
+        {
             for line in elements.split('\n') {
                 data.push(format!("{ELEMENTS_DATALINE_LITERAL} {line}"));
             }

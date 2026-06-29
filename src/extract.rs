@@ -3,23 +3,18 @@ use {
     axum::{
         Json,
         body::Bytes,
-        extract::{FromRequest, OptionalFromRequest, Query, Request},
+        extract::{FromRequest, OptionalFromRequest, Request},
         http::{Method, StatusCode},
         response::{IntoResponse, Response},
     },
-    serde::{Deserialize, de::DeserializeOwned},
+    serde::de::DeserializeOwned,
     tracing::{debug, trace},
 };
-
-#[derive(Deserialize)]
-struct DatastarParam {
-    datastar: serde_json::Value,
-}
 
 #[derive(Debug)]
 pub struct ReadSignals<T: DeserializeOwned>(pub T);
 
-impl<T: DeserializeOwned, S: Send + Sync> OptionalFromRequest<S> for ReadSignals<T>
+impl<T: DeserializeOwned + Default, S: Send + Sync> OptionalFromRequest<S> for ReadSignals<T>
 where
     Bytes: FromRequest<S>,
 {
@@ -37,7 +32,7 @@ where
     }
 }
 
-impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for ReadSignals<T>
+impl<T: DeserializeOwned + Default, S: Send + Sync> FromRequest<S> for ReadSignals<T>
 where
     Bytes: FromRequest<S>,
 {
@@ -47,19 +42,13 @@ where
         match *req.method() {
             Method::GET | Method::DELETE => {
                 debug!(method = %req.method(), "reading Datastar signals from query");
-                let query = Query::<DatastarParam>::from_request(req, state)
-                    .await
-                    .map_err(IntoResponse::into_response)?;
+                let Some(signals) =
+                    datastar_query_param(req.uri().query()).map_err(IntoResponse::into_response)?
+                else {
+                    return Ok(Self(T::default()));
+                };
 
-                let signals = query.0.datastar.as_str().ok_or_else(|| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("{DATASTAR_KEY} query parameter must be a JSON string"),
-                    )
-                        .into_response()
-                })?;
-
-                serde_json::from_str(signals).map(Self).map_err(|_| {
+                serde_json::from_str(&signals).map(Self).map_err(|_| {
                     (
                         StatusCode::BAD_REQUEST,
                         "failed to parse Datastar signals from query",
@@ -82,4 +71,20 @@ where
             }
         }
     }
+}
+
+fn datastar_query_param(query: Option<&str>) -> Result<Option<String>, (StatusCode, &'static str)> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let params = serde_urlencoded::from_str::<Vec<(String, String)>>(query).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "failed to parse Datastar signals from query",
+        )
+    })?;
+
+    Ok(params
+        .into_iter()
+        .find_map(|(key, value)| (key == DATASTAR_KEY && !value.is_empty()).then_some(value)))
 }

@@ -1,8 +1,3 @@
-use bytes::Bytes;
-
-#[cfg(feature = "compression")]
-use std::io::Write;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionStrategy {
     ServerPriority,
@@ -101,46 +96,4 @@ pub(crate) fn parse_accept_encoding(header: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect()
-}
-
-#[cfg(feature = "compression")]
-pub(crate) fn compress_chunk(
-    algorithm: CompressionAlgorithm,
-    bytes: &Bytes,
-) -> Result<Bytes, std::io::Error> {
-    match algorithm {
-        CompressionAlgorithm::Gzip => {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(bytes)?;
-            Ok(Bytes::from(encoder.finish()?))
-        }
-        CompressionAlgorithm::Deflate => {
-            let mut encoder =
-                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(bytes)?;
-            Ok(Bytes::from(encoder.finish()?))
-        }
-        CompressionAlgorithm::Brotli => {
-            let mut out = Vec::new();
-            {
-                let mut encoder = brotli::CompressorWriter::new(&mut out, 4096, 6, 22);
-                encoder.write_all(bytes)?;
-            }
-            Ok(Bytes::from(out))
-        }
-        CompressionAlgorithm::Zstd => {
-            let out = zstd::stream::encode_all(bytes.as_ref(), 0)?;
-            Ok(Bytes::from(out))
-        }
-    }
-}
-
-#[cfg(not(feature = "compression"))]
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn compress_chunk(
-    _algorithm: CompressionAlgorithm,
-    bytes: &Bytes,
-) -> Result<Bytes, std::io::Error> {
-    Ok(bytes.clone())
 }

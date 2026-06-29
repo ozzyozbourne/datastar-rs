@@ -1,13 +1,10 @@
 use {
-    crate::{
-        Compression, DatastarEvent, ExecuteScript, PatchElements, PatchSignals, SignalError,
-        compression::compress_chunk,
-    },
+    crate::{Compression, DatastarEvent, ExecuteScript, PatchElements, PatchSignals, SignalError},
     axum::{
         body::Body,
         http::{
             HeaderMap, HeaderValue, StatusCode,
-            header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE},
+            header::{CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_TYPE},
         },
         response::{IntoResponse, Response},
     },
@@ -19,6 +16,13 @@ use {
     tokio::sync::mpsc,
     tokio_stream::wrappers::ReceiverStream,
     tracing::{Instrument, debug, error, trace, warn},
+};
+
+#[cfg(feature = "compression")]
+use {
+    async_compression::tokio::write::{BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder},
+    tokio::io::{AsyncWrite, AsyncWriteExt},
+    tokio_util::io::ReaderStream,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +163,14 @@ impl DatastarSse {
             "creating Datastar SSE response body"
         );
         let content_encoding = algorithm.map(crate::CompressionAlgorithm::encoding);
+        #[cfg(feature = "compression")]
+        if let Some(algorithm) = algorithm {
+            return Self {
+                body: Body::from_stream(compressed_stream(stream, algorithm)),
+                content_encoding,
+            };
+        }
+
         let stream = stream
             .map(move |event| -> Result<Bytes, SseError> {
                 let event = event.map_err(|err| {
@@ -167,24 +179,12 @@ impl DatastarSse {
                 })?;
                 let event_type = event.event.as_str();
                 let bytes = Bytes::from(event.to_sse_string());
-                let uncompressed_len = bytes.len();
-                if let Some(algorithm) = algorithm {
-                    let compressed = compress_chunk(algorithm, &bytes)?;
-                    trace!(
-                        event_type,
-                        content_encoding = algorithm.encoding(),
-                        uncompressed_len,
-                        compressed_len = compressed.len(),
-                        "serialized compressed Datastar SSE event"
-                    );
-                    Ok(compressed)
-                } else {
-                    trace!(
-                        event_type,
-                        uncompressed_len, "serialized Datastar SSE event"
-                    );
-                    Ok(bytes)
-                }
+                trace!(
+                    event_type,
+                    uncompressed_len = bytes.len(),
+                    "serialized Datastar SSE event"
+                );
+                Ok(bytes)
             })
             .map_err(std::io::Error::other);
 
@@ -212,11 +212,79 @@ impl IntoResponse for DatastarSse {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
         if let Some(content_encoding) = self.content_encoding {
             headers.insert(CONTENT_ENCODING, HeaderValue::from_static(content_encoding));
         }
         (StatusCode::OK, headers, self.body).into_response()
     }
+}
+
+#[cfg(feature = "compression")]
+fn compressed_stream<S, E>(
+    stream: S,
+    algorithm: crate::CompressionAlgorithm,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>>
+where
+    S: Stream<Item = Result<DatastarEvent, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let (writer, reader) = tokio::io::duplex(64 * 1024);
+
+    tokio::spawn(async move {
+        let result = match algorithm {
+            crate::CompressionAlgorithm::Brotli => {
+                write_compressed_stream(BrotliEncoder::new(writer), stream, algorithm).await
+            }
+            crate::CompressionAlgorithm::Zstd => {
+                write_compressed_stream(ZstdEncoder::new(writer), stream, algorithm).await
+            }
+            crate::CompressionAlgorithm::Gzip => {
+                write_compressed_stream(GzipEncoder::new(writer), stream, algorithm).await
+            }
+            crate::CompressionAlgorithm::Deflate => {
+                write_compressed_stream(ZlibEncoder::new(writer), stream, algorithm).await
+            }
+        };
+
+        if let Err(err) = result {
+            error!(%err, "Datastar SSE compression stream failed");
+        }
+    });
+
+    ReaderStream::new(reader)
+}
+
+#[cfg(feature = "compression")]
+async fn write_compressed_stream<W, S, E>(
+    mut writer: W,
+    stream: S,
+    algorithm: crate::CompressionAlgorithm,
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+    S: Stream<Item = Result<DatastarEvent, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut stream = Box::pin(stream);
+    while let Some(event) = stream.next().await {
+        let event = event.map_err(|err| {
+            error!(%err, "Datastar SSE source stream failed");
+            std::io::Error::other(err)
+        })?;
+        let event_type = event.event.as_str();
+        let bytes = event.to_sse_string();
+        writer.write_all(bytes.as_bytes()).await?;
+        writer.flush().await?;
+        trace!(
+            event_type,
+            content_encoding = algorithm.encoding(),
+            uncompressed_len = bytes.len(),
+            "serialized compressed Datastar SSE event"
+        );
+    }
+
+    writer.shutdown().await
 }
 
 #[derive(Clone, Debug)]

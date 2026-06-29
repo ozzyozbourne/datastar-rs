@@ -206,9 +206,7 @@ dependencies = [
  "async-compression",
  "async-stream",
  "axum",
- "brotli",
  "bytes",
- "flate2",
  "futures-core",
  "futures-util",
  "http",
@@ -225,7 +223,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-opentelemetry",
- "zstd",
 ]
 
 [[package]]

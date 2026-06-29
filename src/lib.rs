@@ -18,8 +18,9 @@ pub use elements::{PatchElements, remove_element, remove_element_by_id};
 pub use event::DatastarEvent;
 pub use extract::ReadSignals;
 pub use script::{
-    ExecuteScript, ScriptError, console_error, console_log, dispatch_custom_event,
-    dispatch_custom_event_to, prefetch, redirect, replace_url,
+    DispatchCustomEventOptions, ExecuteScript, ScriptError, console_error, console_log,
+    dispatch_custom_event, dispatch_custom_event_to, dispatch_custom_event_with_options, prefetch,
+    redirect, replace_url,
 };
 pub use signals::{PatchSignals, SignalError};
 pub use sse::{DatastarSender, DatastarSse, DatastarSseBuilder, SseError};
@@ -29,6 +30,7 @@ pub use sse::{DatastarSender, DatastarSse, DatastarSseBuilder, SseError};
 /// The SDK emits [`tracing`] spans/events. Applications should install a
 /// `tracing_subscriber` with `tracing_opentelemetry::OpenTelemetryLayer` and
 /// their exporter of choice.
+#[cfg(feature = "telemetry")]
 pub mod telemetry {
     pub use opentelemetry;
     pub use tracing;
