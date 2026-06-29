@@ -8,6 +8,7 @@ use {
         response::{IntoResponse, Response},
     },
     serde::{Deserialize, de::DeserializeOwned},
+    tracing::{debug, trace},
 };
 
 #[derive(Deserialize)]
@@ -26,8 +27,10 @@ where
 
     async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
         if req.headers().get(DATASTAR_REQ_HEADER).is_none() {
+            trace!("request is missing datastar-request header");
             return Ok(None);
         }
+        trace!("request has datastar-request header");
         Ok(Some(
             <Self as FromRequest<S>>::from_request(req, state).await?,
         ))
@@ -43,6 +46,7 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match *req.method() {
             Method::GET | Method::DELETE => {
+                debug!(method = %req.method(), "reading Datastar signals from query");
                 let query = Query::<DatastarParam>::from_request(req, state)
                     .await
                     .map_err(IntoResponse::into_response)?;
@@ -64,6 +68,7 @@ where
                 })
             }
             _ => {
+                debug!(method = %req.method(), "reading Datastar signals from JSON body");
                 let Json(value) = <Json<T> as FromRequest<S>>::from_request(req, state)
                     .await
                     .map_err(|_| {

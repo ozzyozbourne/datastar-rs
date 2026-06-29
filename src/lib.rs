@@ -21,6 +21,17 @@ pub use script::{
 pub use signals::{PatchSignals, SignalError};
 pub use sse::{DatastarSender, DatastarSse, DatastarSseBuilder, SseError};
 
+/// Re-exports for applications that wire Datastar SDK spans into OpenTelemetry.
+///
+/// The SDK emits [`tracing`] spans/events. Applications should install a
+/// `tracing_subscriber` with `tracing_opentelemetry::OpenTelemetryLayer` and
+/// their exporter of choice.
+pub mod telemetry {
+    pub use opentelemetry;
+    pub use tracing;
+    pub use tracing_opentelemetry;
+}
+
 pub mod prelude {
     pub use crate::{
         Compression, CompressionAlgorithm, CompressionStrategy, DatastarEvent, DatastarSender,

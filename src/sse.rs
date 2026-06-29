@@ -18,6 +18,7 @@ use {
     std::{convert::Infallible, future::Future},
     tokio::sync::mpsc,
     tokio_stream::wrappers::ReceiverStream,
+    tracing::{Instrument, debug, error, trace, warn},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -47,16 +48,20 @@ impl Default for DatastarSseBuilder {
 
 impl DatastarSseBuilder {
     pub fn compression(mut self, compression: Compression) -> Self {
+        debug!(?compression, "configured Datastar SSE compression");
         self.compression = Some(compression);
         self
     }
 
     pub fn accept_encoding(mut self, accept_encoding: impl Into<String>) -> Self {
+        let accept_encoding = accept_encoding.into();
+        debug!(%accept_encoding, "configured Datastar SSE Accept-Encoding");
         self.compression = Some(Compression::default().accept_encoding(accept_encoding));
         self
     }
 
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        debug!(capacity, "configured Datastar SSE channel capacity");
         self.channel_capacity = capacity;
         self
     }
@@ -66,6 +71,7 @@ impl DatastarSseBuilder {
         S: Stream<Item = Result<DatastarEvent, E>> + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
     {
+        trace!("creating Datastar SSE from stream");
         DatastarSse::from_stream_with_compression(stream, self.compression)
     }
 
@@ -74,11 +80,16 @@ impl DatastarSseBuilder {
         I: IntoIterator<Item = DatastarEvent>,
         I::IntoIter: Send + 'static,
     {
+        trace!("creating Datastar SSE from event iterator");
         let stream = futures_util::stream::iter(events.into_iter().map(Ok::<_, Infallible>));
         DatastarSse::from_stream_with_compression(stream, self.compression)
     }
 
     pub fn channel(self) -> (DatastarSender, DatastarSse) {
+        debug!(
+            capacity = self.channel_capacity,
+            "creating Datastar SSE channel"
+        );
         let (tx, rx) = mpsc::channel(self.channel_capacity);
         let stream = ReceiverStream::new(rx);
         (
@@ -93,9 +104,14 @@ impl DatastarSseBuilder {
         Fut: Future<Output = Result<(), SseError>> + Send + 'static,
     {
         let (sender, sse) = self.channel();
-        tokio::spawn(async move {
-            let _ = f(sender).await;
-        });
+        tokio::spawn(
+            async move {
+                if let Err(err) = f(sender).await {
+                    error!(%err, "Datastar SSE task failed");
+                }
+            }
+            .instrument(tracing::info_span!("datastar_sse_task")),
+        );
         sse
     }
 }
@@ -138,16 +154,41 @@ impl DatastarSse {
             let _ = compression;
             None::<crate::CompressionAlgorithm>
         };
+        debug!(
+            content_encoding = algorithm
+                .map(|algorithm| algorithm.encoding())
+                .unwrap_or("none"),
+            "creating Datastar SSE response body"
+        );
         let content_encoding = algorithm.map(|algorithm| algorithm.encoding());
         let stream = stream
             .map(move |event| -> Result<Bytes, SseError> {
                 let event = event.map_err(|err| {
+                    error!(%err, "Datastar SSE source stream failed");
                     SseError::Compression(std::io::Error::new(std::io::ErrorKind::Other, err))
                 })?;
+                let event_type = event.event.as_str();
                 let bytes = Bytes::from(event.to_sse_string());
+                let uncompressed_len = bytes.len();
                 match algorithm {
-                    Some(algorithm) => Ok(compress_chunk(algorithm, bytes)?),
-                    None => Ok(bytes),
+                    Some(algorithm) => {
+                        let compressed = compress_chunk(algorithm, bytes)?;
+                        trace!(
+                            event_type,
+                            content_encoding = algorithm.encoding(),
+                            uncompressed_len,
+                            compressed_len = compressed.len(),
+                            "serialized compressed Datastar SSE event"
+                        );
+                        Ok(compressed)
+                    }
+                    None => {
+                        trace!(
+                            event_type,
+                            uncompressed_len, "serialized Datastar SSE event"
+                        );
+                        Ok(bytes)
+                    }
                 }
             })
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
@@ -161,6 +202,10 @@ impl DatastarSse {
 
 impl IntoResponse for DatastarSse {
     fn into_response(self) -> Response {
+        debug!(
+            content_encoding = self.content_encoding.unwrap_or("none"),
+            "building Datastar SSE Axum response"
+        );
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
@@ -178,10 +223,14 @@ pub struct DatastarSender {
 
 impl DatastarSender {
     pub async fn send(&mut self, event: impl Into<DatastarEvent>) -> Result<(), SseError> {
-        self.tx
-            .send(Ok(event.into()))
-            .await
-            .map_err(|_| SseError::Closed)
+        let event = event.into();
+        let event_type = event.event.as_str();
+        self.tx.send(Ok(event)).await.map_err(|_| {
+            warn!(event_type, "Datastar SSE channel is closed");
+            SseError::Closed
+        })?;
+        trace!(event_type, "queued Datastar SSE event");
+        Ok(())
     }
 
     pub async fn patch_elements(&mut self, elements: impl Into<String>) -> Result<(), SseError> {
