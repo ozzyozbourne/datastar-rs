@@ -1,0 +1,8 @@
+target/
+.DS_Store
+
+# Editor and local environment files
+.idea/
+.vscode/
+*.swp
+*.swo
