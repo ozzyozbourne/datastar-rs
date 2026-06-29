@@ -72,7 +72,7 @@ impl DatastarSseBuilder {
         E: std::error::Error + Send + Sync + 'static,
     {
         trace!("creating Datastar SSE from stream");
-        DatastarSse::from_stream_with_compression(stream, self.compression)
+        DatastarSse::from_stream_with_compression(stream, self.compression.as_ref())
     }
 
     pub fn events<I>(self, events: I) -> DatastarSse
@@ -82,7 +82,7 @@ impl DatastarSseBuilder {
     {
         trace!("creating Datastar SSE from event iterator");
         let stream = futures_util::stream::iter(events.into_iter().map(Ok::<_, Infallible>));
-        DatastarSse::from_stream_with_compression(stream, self.compression)
+        DatastarSse::from_stream_with_compression(stream, self.compression.as_ref())
     }
 
     pub fn channel(self) -> (DatastarSender, DatastarSse) {
@@ -94,7 +94,7 @@ impl DatastarSseBuilder {
         let stream = ReceiverStream::new(rx);
         (
             DatastarSender { tx },
-            DatastarSse::from_stream_with_compression(stream, self.compression),
+            DatastarSse::from_stream_with_compression(stream, self.compression.as_ref()),
         )
     }
 
@@ -142,61 +142,64 @@ impl DatastarSse {
         Self::builder().events(events)
     }
 
-    fn from_stream_with_compression<S, E>(stream: S, compression: Option<Compression>) -> Self
+    fn from_stream_with_compression<S, E>(stream: S, compression: Option<&Compression>) -> Self
     where
         S: Stream<Item = Result<DatastarEvent, E>> + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
     {
         #[cfg(feature = "compression")]
-        let algorithm = compression.and_then(|compression| compression.selected_algorithm());
+        let algorithm = compression.and_then(Compression::selected_algorithm);
         #[cfg(not(feature = "compression"))]
         let algorithm = {
             let _ = compression;
             None::<crate::CompressionAlgorithm>
         };
         debug!(
-            content_encoding = algorithm
-                .map(|algorithm| algorithm.encoding())
-                .unwrap_or("none"),
+            content_encoding = algorithm.map_or("none", crate::CompressionAlgorithm::encoding),
             "creating Datastar SSE response body"
         );
-        let content_encoding = algorithm.map(|algorithm| algorithm.encoding());
+        let content_encoding = algorithm.map(crate::CompressionAlgorithm::encoding);
         let stream = stream
             .map(move |event| -> Result<Bytes, SseError> {
                 let event = event.map_err(|err| {
                     error!(%err, "Datastar SSE source stream failed");
-                    SseError::Compression(std::io::Error::new(std::io::ErrorKind::Other, err))
+                    SseError::Compression(std::io::Error::other(err))
                 })?;
                 let event_type = event.event.as_str();
                 let bytes = Bytes::from(event.to_sse_string());
                 let uncompressed_len = bytes.len();
-                match algorithm {
-                    Some(algorithm) => {
-                        let compressed = compress_chunk(algorithm, bytes)?;
-                        trace!(
-                            event_type,
-                            content_encoding = algorithm.encoding(),
-                            uncompressed_len,
-                            compressed_len = compressed.len(),
-                            "serialized compressed Datastar SSE event"
-                        );
-                        Ok(compressed)
-                    }
-                    None => {
-                        trace!(
-                            event_type,
-                            uncompressed_len, "serialized Datastar SSE event"
-                        );
-                        Ok(bytes)
-                    }
+                if let Some(algorithm) = algorithm {
+                    let compressed = compress_chunk(algorithm, &bytes)?;
+                    trace!(
+                        event_type,
+                        content_encoding = algorithm.encoding(),
+                        uncompressed_len,
+                        compressed_len = compressed.len(),
+                        "serialized compressed Datastar SSE event"
+                    );
+                    Ok(compressed)
+                } else {
+                    trace!(
+                        event_type,
+                        uncompressed_len, "serialized Datastar SSE event"
+                    );
+                    Ok(bytes)
                 }
             })
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
+            .map_err(std::io::Error::other);
 
         Self {
             body: Body::from_stream(stream),
             content_encoding,
         }
+    }
+}
+
+impl core::fmt::Debug for DatastarSse {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DatastarSse")
+            .field("content_encoding", &self.content_encoding)
+            .finish_non_exhaustive()
     }
 }
 

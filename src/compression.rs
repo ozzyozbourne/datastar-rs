@@ -106,26 +106,26 @@ pub(crate) fn parse_accept_encoding(header: &str) -> Vec<String> {
 #[cfg(feature = "compression")]
 pub(crate) fn compress_chunk(
     algorithm: CompressionAlgorithm,
-    bytes: Bytes,
+    bytes: &Bytes,
 ) -> Result<Bytes, std::io::Error> {
     match algorithm {
         CompressionAlgorithm::Gzip => {
             let mut encoder =
                 flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(&bytes)?;
+            encoder.write_all(bytes)?;
             Ok(Bytes::from(encoder.finish()?))
         }
         CompressionAlgorithm::Deflate => {
             let mut encoder =
                 flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(&bytes)?;
+            encoder.write_all(bytes)?;
             Ok(Bytes::from(encoder.finish()?))
         }
         CompressionAlgorithm::Brotli => {
             let mut out = Vec::new();
             {
                 let mut encoder = brotli::CompressorWriter::new(&mut out, 4096, 6, 22);
-                encoder.write_all(&bytes)?;
+                encoder.write_all(bytes)?;
             }
             Ok(Bytes::from(out))
         }
@@ -137,9 +137,10 @@ pub(crate) fn compress_chunk(
 }
 
 #[cfg(not(feature = "compression"))]
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn compress_chunk(
     _algorithm: CompressionAlgorithm,
-    bytes: Bytes,
+    bytes: &Bytes,
 ) -> Result<Bytes, std::io::Error> {
-    Ok(bytes)
+    Ok(bytes.clone())
 }

@@ -10,7 +10,10 @@ mod signals;
 mod sse;
 
 pub use compression::{Compression, CompressionAlgorithm, CompressionStrategy};
-pub use consts::{ElementPatchMode, EventType, Namespace};
+pub use consts::{
+    DATASTAR_KEY, DATASTAR_REQ_HEADER, DEFAULT_SSE_RETRY_DURATION, ElementPatchMode, EventType,
+    Namespace,
+};
 pub use elements::{PatchElements, remove_element, remove_element_by_id};
 pub use event::DatastarEvent;
 pub use extract::ReadSignals;

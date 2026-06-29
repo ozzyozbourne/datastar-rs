@@ -3,7 +3,7 @@ use core::time::Duration;
 pub const DATASTAR_KEY: &str = "datastar";
 pub const DATASTAR_REQ_HEADER: &str = "datastar-request";
 
-pub const DEFAULT_SSE_RETRY_DURATION: Duration = Duration::from_millis(1000);
+pub const DEFAULT_SSE_RETRY_DURATION: Duration = Duration::from_secs(1);
 
 pub(crate) const SELECTOR_DATALINE_LITERAL: &str = "selector";
 pub(crate) const MODE_DATALINE_LITERAL: &str = "mode";

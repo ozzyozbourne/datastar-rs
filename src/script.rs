@@ -141,13 +141,13 @@ pub fn dispatch_custom_event<T: Serialize>(
     event_name: impl AsRef<str>,
     detail: &T,
 ) -> Result<ExecuteScript, ScriptError> {
-    dispatch_custom_event_to(event_name, detail, None::<String>)
+    dispatch_custom_event_to(event_name, detail, None)
 }
 
 pub fn dispatch_custom_event_to<T: Serialize>(
     event_name: impl AsRef<str>,
     detail: &T,
-    selector: Option<impl AsRef<str>>,
+    selector: Option<&str>,
 ) -> Result<ExecuteScript, ScriptError> {
     let event_name = event_name.as_ref();
     if event_name.is_empty() {
@@ -155,13 +155,13 @@ pub fn dispatch_custom_event_to<T: Serialize>(
     }
 
     let detail = serde_json::to_string(detail)?;
-    let elements = selector
-        .as_ref()
-        .map(|selector| format!("document.querySelectorAll({:?})", selector.as_ref()))
-        .unwrap_or_else(|| "[document]".to_owned());
+    let elements = selector.map_or_else(
+        || "[document]".to_owned(),
+        |selector| format!("document.querySelectorAll({selector:?})"),
+    );
 
     Ok(ExecuteScript::new(format!(
-        r#"{{
+        r"{{
   const elements = {elements};
   const event = new CustomEvent({event_name:?}, {{
     bubbles: true,
@@ -172,6 +172,6 @@ pub fn dispatch_custom_event_to<T: Serialize>(
   elements.forEach((element) => {{
     element.dispatchEvent(event);
   }});
-}}"#
+}}"
     )))
 }
