@@ -97,6 +97,21 @@ async fn malformed_datastar_query_rejects() {
 }
 
 #[tokio::test]
+async fn malformed_post_body_rejects() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/test")
+        .body(Body::from("{"))
+        .unwrap();
+
+    let response = <ReadSignals<Signals> as FromRequest<()>>::from_request(request, &())
+        .await
+        .unwrap_err();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn optional_without_datastar_request_header_is_none() {
     let request = Request::builder()
         .uri("/test?datastar=%7B%22message%22%3A%22ok%22%2C%22count%22%3A2%7D")

@@ -15,7 +15,7 @@ telemetry = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 [dependencies]
 async-compression = { version = "0.4", optional = true, features = ["tokio", "brotli", "zlib", "gzip", "zstd"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "query", "tokio"] }
+axum = { version = "0.8", default-features = false }
 bytes = "1"
 futures-core = "0.3"
 futures-util = "0.3"

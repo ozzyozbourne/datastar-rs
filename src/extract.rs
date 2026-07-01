@@ -1,7 +1,6 @@
 use {
     crate::consts::{DATASTAR_KEY, DATASTAR_REQ_HEADER},
     axum::{
-        Json,
         body::Bytes,
         extract::{FromRequest, OptionalFromRequest, Request},
         http::{Method, StatusCode},
@@ -14,10 +13,7 @@ use {
 #[derive(Debug)]
 pub struct ReadSignals<T: DeserializeOwned + Default>(pub T);
 
-impl<T: DeserializeOwned + Default, S: Send + Sync> OptionalFromRequest<S> for ReadSignals<T>
-where
-    Bytes: FromRequest<S>,
-{
+impl<T: DeserializeOwned + Default, S: Send + Sync> OptionalFromRequest<S> for ReadSignals<T> {
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
@@ -32,10 +28,7 @@ where
     }
 }
 
-impl<T: DeserializeOwned + Default, S: Send + Sync> FromRequest<S> for ReadSignals<T>
-where
-    Bytes: FromRequest<S>,
-{
+impl<T: DeserializeOwned + Default, S: Send + Sync> FromRequest<S> for ReadSignals<T> {
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
@@ -58,16 +51,21 @@ where
             }
             _ => {
                 debug!(method = %req.method(), "reading Datastar signals from JSON body");
-                let Json(value) = <Json<T> as FromRequest<S>>::from_request(req, state)
-                    .await
-                    .map_err(|_| {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            "failed to parse Datastar signals from body",
-                        )
-                            .into_response()
-                    })?;
-                Ok(Self(value))
+                let body = Bytes::from_request(req, state).await.map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "failed to parse Datastar signals from body",
+                    )
+                        .into_response()
+                })?;
+
+                serde_json::from_slice(&body).map(Self).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "failed to parse Datastar signals from body",
+                    )
+                        .into_response()
+                })
             }
         }
     }
