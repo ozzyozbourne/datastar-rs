@@ -14,34 +14,36 @@ struct Signals {
     count: u8,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 struct RequiredSignals {
     count: u8,
 }
 
 #[tokio::test]
-async fn get_without_datastar_query_rejects() {
+async fn get_without_datastar_query_defaults() {
     let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
-    let response = <ReadSignals<Signals> as FromRequest<()>>::from_request(request, &())
-        .await
-        .unwrap_err();
+    let ReadSignals(signals) =
+        <ReadSignals<Signals> as FromRequest<()>>::from_request(request, &())
+            .await
+            .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(signals, Signals::default());
 }
 
 #[tokio::test]
-async fn get_with_empty_datastar_query_rejects() {
+async fn get_with_empty_datastar_query_defaults() {
     let request = Request::builder()
         .uri("/test?datastar=")
         .body(Body::empty())
         .unwrap();
 
-    let response = <ReadSignals<Signals> as FromRequest<()>>::from_request(request, &())
-        .await
-        .unwrap_err();
+    let ReadSignals(signals) =
+        <ReadSignals<Signals> as FromRequest<()>>::from_request(request, &())
+            .await
+            .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(signals, Signals::default());
 }
 
 #[tokio::test]
@@ -66,7 +68,7 @@ async fn get_with_datastar_query_parses_signals() {
 }
 
 #[tokio::test]
-async fn mandatory_get_accepts_non_default_signals() {
+async fn mandatory_get_accepts_signals_with_default_type() {
     let request = Request::builder()
         .uri("/test?datastar=%7B%22count%22%3A2%7D")
         .body(Body::empty())
@@ -124,7 +126,22 @@ async fn optional_with_datastar_request_header_parses() {
 }
 
 #[tokio::test]
-async fn optional_with_datastar_request_header_accepts_non_default_signals() {
+async fn optional_with_datastar_request_header_and_missing_query_defaults() {
+    let request = Request::builder()
+        .uri("/test")
+        .header("datastar-request", "true")
+        .body(Body::empty())
+        .unwrap();
+
+    let signals = <ReadSignals<Signals> as OptionalFromRequest<()>>::from_request(request, &())
+        .await
+        .unwrap();
+
+    assert_eq!(signals.unwrap().0, Signals::default());
+}
+
+#[tokio::test]
+async fn optional_with_datastar_request_header_accepts_signals_with_default_type() {
     let request = Request::builder()
         .uri("/test?datastar=%7B%22count%22%3A2%7D")
         .header("datastar-request", "true")

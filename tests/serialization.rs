@@ -11,7 +11,7 @@ use {
 
 #[cfg(feature = "compression")]
 use {
-    axum::http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_TYPE},
+    axum::http::header::{CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_TYPE},
     datastar_axum::{Compression, CompressionAlgorithm, CompressionStrategy},
     std::{
         io::Write,
@@ -226,7 +226,8 @@ async fn axum_response_sets_sse_and_compression_headers() {
         response.headers().get(CONTENT_TYPE).unwrap(),
         "text/event-stream"
     );
-    assert_eq!(response.headers().get(CONNECTION).unwrap(), "keep-alive");
+    assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-cache");
+    assert!(response.headers().get(CONNECTION).is_none());
     assert_eq!(response.headers().get(CONTENT_ENCODING).unwrap(), "gzip");
 
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -273,7 +274,7 @@ async fn compression_stream_contains_multiple_events() {
 
 #[tokio::test]
 #[cfg(feature = "compression")]
-async fn compressed_source_stream_errors_are_logged_as_source_errors() {
+async fn compressed_source_stream_errors_are_reported_as_source_errors() {
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -292,10 +293,10 @@ async fn compressed_source_stream_errors_are_logged_as_source_errors() {
         .stream(stream);
     let response = axum::response::IntoResponse::into_response(sse);
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+    let err = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap();
-    assert!(body.is_empty());
+        .unwrap_err();
+    assert!(err.to_string().contains("SSE source stream failed"));
 
     let logs = logs.as_string();
     assert!(logs.contains("Datastar SSE source stream failed"));
@@ -328,7 +329,7 @@ async fn decode_body(algorithm: CompressionAlgorithm, body: &[u8]) -> String {
 
 #[tokio::test]
 async fn channel_sender_streams_events() {
-    let (mut sender, sse) = datastar_axum::DatastarSse::builder().channel();
+    let (sender, sse) = datastar_axum::DatastarSse::builder().channel();
     sender
         .patch_elements("<div id=\"x\">x</div>")
         .await

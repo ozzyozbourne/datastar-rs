@@ -12,9 +12,9 @@ use {
 };
 
 #[derive(Debug)]
-pub struct ReadSignals<T: DeserializeOwned>(pub T);
+pub struct ReadSignals<T: DeserializeOwned + Default>(pub T);
 
-impl<T: DeserializeOwned, S: Send + Sync> OptionalFromRequest<S> for ReadSignals<T>
+impl<T: DeserializeOwned + Default, S: Send + Sync> OptionalFromRequest<S> for ReadSignals<T>
 where
     Bytes: FromRequest<S>,
 {
@@ -32,7 +32,7 @@ where
     }
 }
 
-impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for ReadSignals<T>
+impl<T: DeserializeOwned + Default, S: Send + Sync> FromRequest<S> for ReadSignals<T>
 where
     Bytes: FromRequest<S>,
 {
@@ -45,9 +45,7 @@ where
                 let Some(signals) =
                     datastar_query_param(req.uri().query()).map_err(IntoResponse::into_response)?
                 else {
-                    return Err(
-                        (StatusCode::BAD_REQUEST, "missing datastar query param").into_response()
-                    );
+                    return Ok(Self(T::default()));
                 };
 
                 serde_json::from_str(&signals).map(Self).map_err(|_| {

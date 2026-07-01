@@ -10,7 +10,6 @@ description = "Axum-only Datastar SDK with SSE and compression"
 default = ["compression"]
 compression = [
     "dep:async-compression",
-    "dep:tokio-util",
 ]
 telemetry = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
@@ -26,7 +25,6 @@ serde_urlencoded = "0.7"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "rt", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = { version = "0.7", optional = true, features = ["io"] }
 tracing = "0.1"
 tracing-opentelemetry = { version = "0.30", optional = true }
 opentelemetry = { version = "0.29", optional = true }

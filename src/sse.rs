@@ -4,7 +4,7 @@ use {
         body::Body,
         http::{
             HeaderMap, HeaderValue, StatusCode,
-            header::{CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_TYPE},
+            header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE},
         },
         response::{IntoResponse, Response},
     },
@@ -21,8 +21,12 @@ use {
 #[cfg(feature = "compression")]
 use {
     async_compression::tokio::write::{BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder},
+    std::{
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    },
     tokio::io::{AsyncWrite, AsyncWriteExt},
-    tokio_util::io::ReaderStream,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +71,7 @@ impl DatastarSseBuilder {
     }
 
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         debug!(capacity, "configured Datastar SSE channel capacity");
         self.channel_capacity = capacity;
         self
@@ -217,7 +222,6 @@ impl IntoResponse for DatastarSse {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
         if let Some(content_encoding) = self.content_encoding {
             headers.insert(CONTENT_ENCODING, HeaderValue::from_static(content_encoding));
         }
@@ -234,69 +238,196 @@ where
     S: Stream<Item = Result<DatastarEvent, E>> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let (writer, reader) = tokio::io::duplex(64 * 1024);
-
-    tokio::spawn(
-        async move {
-            let result = match algorithm {
-                crate::CompressionAlgorithm::Brotli => {
-                    write_compressed_stream(BrotliEncoder::new(writer), stream, algorithm).await
-                }
-                crate::CompressionAlgorithm::Zstd => {
-                    write_compressed_stream(ZstdEncoder::new(writer), stream, algorithm).await
-                }
-                crate::CompressionAlgorithm::Gzip => {
-                    write_compressed_stream(GzipEncoder::new(writer), stream, algorithm).await
-                }
-                crate::CompressionAlgorithm::Deflate => {
-                    write_compressed_stream(ZlibEncoder::new(writer), stream, algorithm).await
-                }
-            };
-
-            if let Err(err) = result {
-                match err {
-                    SseError::Source(err) => error!(%err, "Datastar SSE source stream failed"),
-                    err => error!(%err, "Datastar SSE compression stream failed"),
-                }
-            }
-        }
-        .instrument(tracing::debug_span!("datastar_sse_compression")),
-    );
-
-    ReaderStream::new(reader)
+    futures_util::stream::try_unfold(
+        CompressedStreamState::new(stream, algorithm),
+        |state| async move { state.next_chunk().await },
+    )
 }
 
 #[cfg(feature = "compression")]
-async fn write_compressed_stream<W, S, E>(
-    mut writer: W,
-    stream: S,
+struct CompressedStreamState<S> {
+    stream: Pin<Box<S>>,
+    encoder: CompressionEncoder<BufferedWriter>,
+    buffer: SharedBuffer,
     algorithm: crate::CompressionAlgorithm,
-) -> Result<(), SseError>
+    shutdown: bool,
+}
+
+#[cfg(feature = "compression")]
+impl<S, E> CompressedStreamState<S>
 where
-    W: AsyncWrite + Unpin,
     S: Stream<Item = Result<DatastarEvent, E>>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let mut stream = Box::pin(stream);
-    while let Some(event) = stream.next().await {
-        let event = event.map_err(|err| {
-            error!(%err, "Datastar SSE source stream failed");
-            SseError::Source(std::io::Error::other(err))
-        })?;
-        let event_type = event.event.as_str();
-        let bytes = event.to_sse_string();
-        writer.write_all(bytes.as_bytes()).await?;
-        writer.flush().await?;
-        trace!(
-            event_type,
-            content_encoding = algorithm.encoding(),
-            uncompressed_len = bytes.len(),
-            "serialized compressed Datastar SSE event"
-        );
+    fn new(stream: S, algorithm: crate::CompressionAlgorithm) -> Self {
+        let buffer = SharedBuffer::default();
+        let writer = BufferedWriter::new(buffer.clone());
+        let encoder = CompressionEncoder::new(writer, algorithm);
+
+        Self {
+            stream: Box::pin(stream),
+            encoder,
+            buffer,
+            algorithm,
+            shutdown: false,
+        }
     }
 
-    writer.shutdown().await?;
-    Ok(())
+    async fn next_chunk(mut self) -> Result<Option<(Bytes, Self)>, std::io::Error> {
+        loop {
+            if self.shutdown {
+                return Ok(None);
+            }
+
+            let Some(event) = self.stream.next().await else {
+                self.encoder.shutdown().await.map_err(compression_error)?;
+                self.shutdown = true;
+                let chunk = self.buffer.drain();
+                return if chunk.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some((chunk, self)))
+                };
+            };
+
+            let event = event.map_err(|err| {
+                let err = SseError::Source(std::io::Error::other(err));
+                error!(%err, "Datastar SSE source stream failed");
+                std::io::Error::other(err)
+            })?;
+            let event_type = event.event.as_str();
+            let bytes = event.to_sse_string();
+            self.encoder
+                .write_all(bytes.as_bytes())
+                .await
+                .map_err(compression_error)?;
+            self.encoder.flush().await.map_err(compression_error)?;
+            trace!(
+                event_type,
+                content_encoding = self.algorithm.encoding(),
+                uncompressed_len = bytes.len(),
+                "serialized compressed Datastar SSE event"
+            );
+
+            let chunk = self.buffer.drain();
+            if !chunk.is_empty() {
+                return Ok(Some((chunk, self)));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "compression")]
+#[derive(Clone, Default)]
+struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(feature = "compression")]
+impl SharedBuffer {
+    fn drain(&self) -> Bytes {
+        let mut buffer = self.0.lock().expect("compression buffer should not poison");
+        Bytes::from(std::mem::take(&mut *buffer))
+    }
+}
+
+#[cfg(feature = "compression")]
+struct BufferedWriter {
+    buffer: SharedBuffer,
+}
+
+#[cfg(feature = "compression")]
+impl BufferedWriter {
+    fn new(buffer: SharedBuffer) -> Self {
+        Self { buffer }
+    }
+}
+
+#[cfg(feature = "compression")]
+impl AsyncWrite for BufferedWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.buffer
+            .0
+            .lock()
+            .expect("compression buffer should not poison")
+            .extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "compression")]
+enum CompressionEncoder<W> {
+    Brotli(Box<BrotliEncoder<W>>),
+    Zstd(Box<ZstdEncoder<W>>),
+    Gzip(Box<GzipEncoder<W>>),
+    Deflate(Box<ZlibEncoder<W>>),
+}
+
+#[cfg(feature = "compression")]
+impl<W: AsyncWrite> CompressionEncoder<W> {
+    fn new(writer: W, algorithm: crate::CompressionAlgorithm) -> Self {
+        match algorithm {
+            crate::CompressionAlgorithm::Brotli => {
+                Self::Brotli(Box::new(BrotliEncoder::new(writer)))
+            }
+            crate::CompressionAlgorithm::Zstd => Self::Zstd(Box::new(ZstdEncoder::new(writer))),
+            crate::CompressionAlgorithm::Gzip => Self::Gzip(Box::new(GzipEncoder::new(writer))),
+            crate::CompressionAlgorithm::Deflate => {
+                Self::Deflate(Box::new(ZlibEncoder::new(writer)))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "compression")]
+impl<W: AsyncWrite + Unpin> AsyncWrite for CompressionEncoder<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Brotli(encoder) => Pin::new(encoder.as_mut()).poll_write(cx, buf),
+            Self::Zstd(encoder) => Pin::new(encoder.as_mut()).poll_write(cx, buf),
+            Self::Gzip(encoder) => Pin::new(encoder.as_mut()).poll_write(cx, buf),
+            Self::Deflate(encoder) => Pin::new(encoder.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Brotli(encoder) => Pin::new(encoder.as_mut()).poll_flush(cx),
+            Self::Zstd(encoder) => Pin::new(encoder.as_mut()).poll_flush(cx),
+            Self::Gzip(encoder) => Pin::new(encoder.as_mut()).poll_flush(cx),
+            Self::Deflate(encoder) => Pin::new(encoder.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Brotli(encoder) => Pin::new(encoder.as_mut()).poll_shutdown(cx),
+            Self::Zstd(encoder) => Pin::new(encoder.as_mut()).poll_shutdown(cx),
+            Self::Gzip(encoder) => Pin::new(encoder.as_mut()).poll_shutdown(cx),
+            Self::Deflate(encoder) => Pin::new(encoder.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+#[cfg(feature = "compression")]
+fn compression_error(err: std::io::Error) -> std::io::Error {
+    let err = SseError::Compression(err);
+    error!(%err, "Datastar SSE compression stream failed");
+    std::io::Error::other(err)
 }
 
 #[derive(Clone, Debug)]
@@ -305,7 +436,7 @@ pub struct DatastarSender {
 }
 
 impl DatastarSender {
-    pub async fn send(&mut self, event: impl Into<DatastarEvent>) -> Result<(), SseError> {
+    pub async fn send(&self, event: impl Into<DatastarEvent>) -> Result<(), SseError> {
         let event = event.into();
         let event_type = event.event.as_str();
         self.tx.send(Ok(event)).await.map_err(|_| {
@@ -316,39 +447,39 @@ impl DatastarSender {
         Ok(())
     }
 
-    pub async fn patch_elements(&mut self, elements: impl Into<String>) -> Result<(), SseError> {
+    pub async fn patch_elements(&self, elements: impl Into<String>) -> Result<(), SseError> {
         self.send(PatchElements::new(elements)).await
     }
 
-    pub async fn patch_signals(&mut self, signals: impl Into<String>) -> Result<(), SseError> {
+    pub async fn patch_signals(&self, signals: impl Into<String>) -> Result<(), SseError> {
         self.send(PatchSignals::new(signals)).await
     }
 
-    pub async fn patch_signals_json<T: Serialize>(&mut self, signals: &T) -> Result<(), SseError> {
+    pub async fn patch_signals_json<T: Serialize>(&self, signals: &T) -> Result<(), SseError> {
         self.send(PatchSignals::json(signals)?).await
     }
 
     pub async fn patch_signals_if_missing(
-        &mut self,
+        &self,
         signals: impl Into<String>,
     ) -> Result<(), SseError> {
         self.send(PatchSignals::new(signals).only_if_missing(true))
             .await
     }
 
-    pub async fn execute_script(&mut self, script: impl Into<String>) -> Result<(), SseError> {
+    pub async fn execute_script(&self, script: impl Into<String>) -> Result<(), SseError> {
         self.send(ExecuteScript::new(script)).await
     }
 
-    pub async fn console_log(&mut self, message: impl AsRef<str>) -> Result<(), SseError> {
+    pub async fn console_log(&self, message: impl AsRef<str>) -> Result<(), SseError> {
         self.send(crate::console_log(message)).await
     }
 
-    pub async fn console_error(&mut self, message: impl AsRef<str>) -> Result<(), SseError> {
+    pub async fn console_error(&self, message: impl AsRef<str>) -> Result<(), SseError> {
         self.send(crate::console_error(message)).await
     }
 
-    pub async fn redirect(&mut self, url: impl AsRef<str>) -> Result<(), SseError> {
+    pub async fn redirect(&self, url: impl AsRef<str>) -> Result<(), SseError> {
         self.send(crate::redirect(url)).await
     }
 }
